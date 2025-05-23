@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/alexflint/go-arg"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	v1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -29,6 +32,7 @@ type Config struct {
 	QueryTimeout    time.Duration `arg:"--query-timeout,env:QUERY_TIMEOUT" default:"100ms" help:"DNS query timeout"`
 	LoopInterval    time.Duration `arg:"--loop-interval,env:LOOP_INTERVAL" default:"100ms" help:"Probe loop interval"`
 	SummaryInterval time.Duration `arg:"--summary-interval,env:SUMMARY_INTERVAL" default:"10s" help:"Summary interval"`
+	MetricsAddr     string        `arg:"--metrics-addr,env:METRICS_ADDR" default:":9153" help:"Address to serve metrics on"`
 }
 
 // global settings populated in main()
@@ -39,6 +43,33 @@ var (
 	queryTimeout    time.Duration
 	loopInterval    time.Duration
 	summaryInterval time.Duration
+	metricsAddr     string
+)
+
+// Prometheus metrics
+var (
+	dnsQueryTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "coredns_probe_query_total",
+			Help: "Total number of DNS queries sent to CoreDNS endpoints",
+		},
+		[]string{"endpoint"},
+	)
+	dnsQueryFailed = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "coredns_probe_query_failed",
+			Help: "Number of failed DNS queries sent to CoreDNS endpoints",
+		},
+		[]string{"endpoint"},
+	)
+	dnsQueryDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "coredns_probe_query_duration_seconds",
+			Help:    "DNS query duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"endpoint"},
+	)
 )
 
 func main() {
@@ -47,6 +78,21 @@ func main() {
 	namespace, serviceName = cfg.Namespace, cfg.ServiceName
 	queryDomain, queryTimeout = cfg.QueryDomain, cfg.QueryTimeout
 	loopInterval, summaryInterval = cfg.LoopInterval, cfg.SummaryInterval
+	metricsAddr = cfg.MetricsAddr
+
+	// Register Prometheus metrics
+	prometheus.MustRegister(dnsQueryTotal)
+	prometheus.MustRegister(dnsQueryFailed)
+	prometheus.MustRegister(dnsQueryDuration)
+
+	// Start metrics server
+	http.Handle("/metrics", promhttp.Handler())
+	go func() {
+		log.Printf("Starting metrics server on %s", metricsAddr)
+		if err := http.ListenAndServe(metricsAddr, nil); err != nil {
+			log.Fatalf("Failed to start metrics server: %v", err)
+		}
+	}()
 
 	ctx := context.Background()
 	client := mustClient()
@@ -88,13 +134,16 @@ func main() {
 					defer wg.Done()
 					st := stats[i]
 					st.total.Add(1)
+					dnsQueryTotal.WithLabelValues(addr).Inc()
 
 					rtt, err := lookupThrough(addr)
 					if err != nil || rtt > queryTimeout {
 						st.fail.Add(1)
+						dnsQueryFailed.WithLabelValues(addr).Inc()
 						return
 					}
 					st.rttNanos.Add(rtt.Nanoseconds())
+					dnsQueryDuration.WithLabelValues(addr).Observe(rtt.Seconds())
 				}(idx, ip)
 			}
 			wg.Wait()
